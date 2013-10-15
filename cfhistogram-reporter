@@ -271,9 +271,9 @@ and sends the data to a metric backend such as graphite
 	                help="Prefix for all metrics. You can add ${HOSTNAME} in the prefix and it will be replaced with 'domain.hostname'. Note that you'd need to use single quotes in the command line so the $ sign will not be parsed by the shell")
 	parser.add_option("-L","--local-mode",dest="local_mode",default=False,action='store_true',
                         help="Activate local mode (logging to console)")
-	parser.add_option("-b","--bucket-value-list",dest="bucket_value_list",default=None,
-                        help="Comma separated list of bucket values (e.g. 1,10,100,1000,10000")
-	parser.add_option("-r","--required-percentiles-list",dest="required_percentiles_list",default=None,
+	parser.add_option("-b","--bucket-value-list",dest="bucket_value_list",default="1,10,100,1000,10000",
+                        help="Comma separated list of bucket values (e.g. 1,10,100,1000,10000). ALL will be added in the future")
+	parser.add_option("-r","--required-percentiles-list",dest="required_percentiles_list",default="0.25,0.5,0.9,0.99,0.999,1",
                         help="Comma separated list of percentile values, floating point style - e.g. 0.0001,0.25,0.5,0.9,0.99,0.999")
 
 	(options,args) = parser.parse_args()
@@ -301,6 +301,10 @@ and sends the data to a metric backend such as graphite
 
 	if options.port is None:
 		show_error_and_exit("Port must be provided",show_help=False)
+
+	if options.keyspace is None:
+		show_error_and_exit("Keyspace must be provided",show_help=False)
+
 
 	if options.column_families is None:
 		show_error_and_exit("Column families must be provided",show_help=False)
