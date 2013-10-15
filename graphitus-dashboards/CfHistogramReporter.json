@@ -1,0 +1,89 @@
+{
+    "_id": "cassandra.CfHistogramReporter",
+    "averageSeries": false,
+    "columns": 2,
+    "refresh": true,
+    "refreshIntervalSeconds": 60,
+    "theme": "eggplant",
+    "title": "Cassandra cfhistogram Reporter",
+    "until": "",
+    "user": "harelba",
+    "width": 700,
+    "defaultLineWidth": 2,
+    "from": "",
+    "height": 450,
+    "hoursBack": 24,
+    "legend": true,
+    "data": [
+        {
+            "params": "",
+            "target": "groupByNode(//metric_name_prefix//.${dc}.${hostname}.data.${keyspace}.${column_family}.histogram.${measurement}.value*.count,${group-by},'sumSeries')",
+            "title": "Measurement Histogram (keys x counts, where keys are either ms or pure numbers)"
+        },{
+            "params": "",
+            "target": "groupByNode(//metric_name_prefix//.${dc}.${hostname}.data.${keyspace}.${column_family}.percentiles.${measurement}.percentile*.value,${group-by},'sumSeries')",
+            "title": "Measurement percentiles (keys x counts, where keys are either ms or pure numbers)"
+        },{
+            "params": "",
+            "target": "groupByNode(//metric_name_prefix//.${dc}.${hostname}.metadata.execution.*_error_*,6,'sumSeries')",
+            "title": "Analysis Error counts, by error type"
+        },{
+            "params": "",
+            "target": "//metric_name_prefix//.${dc}.${hostname}.metadata.execution.total_time",
+            "title": "Analysis total duration"
+        }
+    ],
+    "parameters": {
+        "dc": {
+          "type": "dynamic",
+          "query": "//metric_name_prefix//.*",
+          "index": 3,
+          "showAll": true
+        },
+        "hostname": {
+          "type": "dynamic",
+          "query": "//metric_name_prefix//.${dc}.*",
+          "index": 4,
+          "showAll": true
+        },
+	"keyspace": {
+          "type": "dynamic",
+          "query": "//metric_name_prefix//.${dc}.${hostname}.data.*",
+          "index": 6,
+          "showAll": false
+        },
+ 	"column_family": {
+          "type": "dynamic",
+          "query": "//metric_name_prefix//.${dc}.${hostname}.data.${keyspace}.*",
+          "index": 7,
+          "showAll": false
+        },
+	"measurement": {
+          "type": "dynamic",
+          "query": "//metric_name_prefix//.${dc}.${hostname}.data.${keyspace}.${column_family}.histogram.*",
+          "index": 9,
+          "showAll": false
+        },
+        "group_by": {
+             "Histogram Value/Percentile": {
+                "group-by": 10
+            },
+           "Keyspace": {
+                "group-by": 6
+            },
+            "Column Family": {
+                "group-by": 7
+            },
+            "Measurement": {
+                "group-by": 9
+            },
+            "Datacenter": {
+                "group-by": 3
+            },
+            "Host": {
+                "group-by": 4
+            }
+       }
+    }
+	
+}
