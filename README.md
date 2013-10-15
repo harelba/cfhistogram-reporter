@@ -1,4 +1,7 @@
 cfhistogram-reporter
 ====================
 
-A Cassandra cfhistogram output analyzer which sends its output to a metric backend
+This tool sends the output of cassandra's cfhistogram to a metric backend such as graphite.
+
+
+Documentation is WIP
