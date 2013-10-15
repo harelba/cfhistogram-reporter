@@ -1,0 +1,410 @@
+#!/usr/bin/python
+
+# cfhistogram reporter
+#
+# Author: Harel Ben-Attia, harelba on GitHub, @harelba on Twitter
+#
+# October 2013
+
+import os,sys,time
+import math
+import socket
+import csv
+import re
+import glob
+from optparse import OptionParser
+import traceback
+import logging
+import logging.handlers
+import random
+import fnmatch
+from collections import defaultdict
+
+from subprocess import PIPE,Popen,STDOUT
+
+def run_command(cmd_to_run,get_output=True,raise_on_error=False):
+    p = Popen(cmd_to_run,stdout=PIPE,stderr=STDOUT,shell=True)
+    output = []
+    line = p.stdout.readline()
+    while line:
+        line = line[:-1]
+        logging.info('stdout+stderr:%s' % line)
+        if get_output:
+            output.append(line)
+
+        line = p.stdout.readline()
+
+    p.wait()
+    if raise_on_error and p.returncode != 0:
+        raise Exception("Command execution failed")
+    if get_output:
+        return (p.returncode,"\n".join(output))
+    else:
+        return p.returncode
+
+class CfHistogramRunner(object):
+	def __init__(self,keyspace,column_family,host,port):
+		self.keyspace = keyspace
+		self.column_family = column_family
+		self.host = host
+		self.port = port
+
+	def run(self):
+		#return file('example-out').read()
+		host = self.host
+		port = self.port
+		keyspace = self.keyspace
+		column_family = self.column_family
+		retcode,output = run_command('nodetool -h %(host)s -p %(port)s cfhistograms %(keyspace)s %(column_family)s' % vars(),raise_on_error = True)
+		return output
+
+class MeasurementHistogram(object):
+	def __init__(self,name):
+		self.name = name
+		self.values = []
+		# each count contains a list of counts, even if there is only one count
+		self.counts = []
+	
+	def add_value(self,value,count):
+		if value not in self.values:
+			self.values.append(value)
+			self.counts.append([count])
+		else:
+			self.counts[self.values.index(value)].append(count)
+
+	def iteritems(self):
+		for value,subcounts in zip(self.values,self.counts):
+			yield value,sum(subcounts)
+
+	def get_highest_value(self):
+		if len(self.values) == 0:
+			return sys.maxint
+		else:
+			return self.values[-1]
+
+	def get_total_count(self):
+		return sum([sum(subcounts) for subcounts in self.counts])
+
+	def get_metric_data_list(self,prefix):
+		name = self.name
+		l = []
+		for value,count in self.iteritems():
+			v = value
+			if v == sys.maxint:
+				v = 'maxint'
+			l.append(MetricData("%(prefix)s.histogram.%(name)s.value_%(v)s.count" % vars(),count))
+
+		return l
+
+	def __str__(self):
+		return "MeasurementHistogram(name=%s,values=%s,counts=%s)" % (self.name,self.values,self.counts)
+	__repr__ = __str__
+
+class HistogramReducer(object):
+	def __init__(self,bucket_value_list):
+		self.bucket_value_list = bucket_value_list
+
+	def determine_new_bucket(self,value):
+		l = filter(lambda x: x >= value,self.bucket_value_list)
+		if len(l) == 0:
+			return sys.maxint
+		else:
+			return l[0]
+
+
+	def reduce_histogram(self,histogram):
+		reduced_histogram = MeasurementHistogram(histogram.name)
+		for value,count in histogram.iteritems():
+			new_bucket = self.determine_new_bucket(value)
+			reduced_histogram.add_value(new_bucket,count)
+		return reduced_histogram
+
+class HistogramPercentileCalculator(object):
+	def __init__(self,name,required_percentiles_list):
+		self.name = name
+		self.required_percentiles_list = required_percentiles_list
+		self.results_list = []
+
+	def calculate_percentiles(self,histogram):
+		total_count = histogram.get_total_count()
+
+		for required_percentile in self.required_percentiles_list:
+			p_expected_amount = total_count * required_percentile
+			p_actual_amount = 0
+			found = False
+			for i,(value,count) in enumerate(histogram.iteritems()):
+				p_actual_amount += count
+				if p_actual_amount >= p_expected_amount:
+					self.results_list.append(value)
+					found = True
+					break
+			if not found:
+				self.results_list.append(histogram.get_highest_value())
+
+	def iter_results(self):
+		for percentile,value in zip(self.required_percentiles_list,self.results_list):
+			yield percentile,value
+
+	def get_metric_data_list(self,prefix):
+		l = []
+		name = self.name
+		for percentile,value in self.iter_results():
+			p_str = ("%4.6f" % percentile).replace(".","_")
+			l.append(MetricData("%(prefix)s.percentiles.%(name)s.percentile__%(p_str)s.value" % vars(),value))
+		return l
+
+
+class CfHistorgramAnalyzer(object):
+	
+	def __init__(self,output):
+		self.output = output
+		self.measurement_types = { 1 : 'sstables' , 2 : 'write_latency' , 3 : 'read_latency' , 4 : 'row_size' , 5 : 'column_count' }
+		#self.measurement_types = { 5 : 'column_count' }
+		self.measurement_histograms = {}
+		self.rebucketized_data = None
+
+	def iter_histograms(self):
+		for name in sorted(self.measurement_histograms.keys()):
+			yield name,self.measurement_histograms[name]
+
+	def analyze(self,output):
+		lines = output.split("\n")[2:]
+		parsed_data = []
+		for line in lines:
+			if line.strip() == '':
+				continue
+			parts = [int(x) for x in line.split()]
+			if len(parts) == 5:
+				parts.insert(1,0)
+			for position,name in self.measurement_types.iteritems():
+				count = parts[position]
+				value = parts[0]
+				if name not in self.measurement_histograms:
+					self.measurement_histograms[name] = MeasurementHistogram(name)
+				self.measurement_histograms[name].add_value(value,count)
+
+def get_source_host():
+        return os.uname()[1]
+
+def reverse_hostname(hn):
+        if '.' in hn and not hn[0].isdigit():
+                name,domain = hn.split(".",1)
+                domain = domain.replace(".","_")
+                return "%s.%s" % (domain,name)
+        else:
+                return 'unknown-domain.%s' % hn.replace('.','_')
+
+def materialize_metric_name_prefix(metric_name_prefix):
+        HOSTNAME = reverse_hostname(get_source_host())
+
+        result = metric_name_prefix.replace("${HOSTNAME}",HOSTNAME)
+
+        if len(result) > 0 and result[-1] != '.':
+                result = result + "."
+
+        return result
+
+class MetricData(object):
+	def __init__(self,name,value):
+		self.name = name
+		self.value = value
+
+class MetricsSender(object):
+	def __init__(self,metric_name_prefix,metric_client):
+		self.metric_name_prefix = metric_name_prefix
+		self.metric_client = metric_client
+
+	def send(self,ref_time,metric_data_list):
+		if metric_data_list is None:
+			return
+		metric_name_prefix = self.metric_name_prefix
+		for metric_data in metric_data_list:
+			name = metric_data.name
+			self.metric_client.add_metric("%(metric_name_prefix)s%(name)s" % vars(),metric_data.value,ref_time)
+
+	def done(self):
+		self.metric_client.done()
+
+def setup_logging(local_mode=False):
+	FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
+
+	if local_mode:
+		logging.basicConfig(format=FORMAT, level=logging.INFO)
+		return
+
+	log_folder = os.path.join(os.path.split(sys.argv[0])[0],'logs')
+	if not os.path.exists(log_folder):
+		os.makedirs(log_folder)
+	log_filename = os.path.join(os.path.split(sys.argv[0])[0],'logs','cfhistogram-reporter.log')
+	logger = logging.getLogger()
+	logger.setLevel(logging.INFO)
+	handler = logging.handlers.RotatingFileHandler(log_filename,maxBytes=20000000,backupCount=5)
+	handler.setFormatter(logging.Formatter(FORMAT))
+	logger.addHandler(handler)
+
+def show_error_and_exit(msg,error_code=1,show_help=True):
+	logging.error(msg)
+	print >>sys.stderr,msg
+	if show_help:
+		parser.print_help()
+	sys.exit(error_code)
+
+if __name__ == '__main__':
+	parser = OptionParser(usage="""
+This program reads cassandra nodetool's cfhistogram output, analyzes it, 
+and sends the data to a metric backend such as graphite
+""")
+	parser.add_option("-k","--keyspace",dest="keyspace",default=None,
+	                help="Keyspace")
+	parser.add_option("-c","--column-family",dest="column_families",default=None,
+	                help="column family list. Currently, needs to be specified manually. ALL will be added in the future")
+	parser.add_option("-H","--host-list",dest="host_list",default=None,
+	                help="list of hosts")
+	parser.add_option("-p","--port",dest="port",default=None,
+	                help="port (same for all hosts)")
+
+	parser.add_option("-C","--metric-client-type",dest="metric_client_type",default=None,
+	                help="Type of metric client. currently supported types are 'stdout' and 'graphite'. The 'graphite' type requires the following client params (-P): 'server=X,port=Y'")
+	parser.add_option("-P","--metric-client-params",dest="metric_client_params",default=None,
+	                help="Comma separated list of parameters in the format x=y. Will be passed to the metric client")
+	parser.add_option("-n","--metric-name-prefix",dest="metric_name_prefix",default=None,
+	                help="Prefix for all metrics. You can add ${HOSTNAME} in the prefix and it will be replaced with 'domain.hostname'. Note that you'd need to use single quotes in the command line so the $ sign will not be parsed by the shell")
+	parser.add_option("-L","--local-mode",dest="local_mode",default=False,action='store_true',
+                        help="Activate local mode (logging to console)")
+	parser.add_option("-b","--bucket-value-list",dest="bucket_value_list",default=None,
+                        help="Comma separated list of bucket values (e.g. 1,10,100,1000,10000")
+	parser.add_option("-r","--required-percentiles-list",dest="required_percentiles_list",default=None,
+                        help="Comma separated list of percentile values, floating point style - e.g. 0.0001,0.25,0.5,0.9,0.99,0.999")
+
+	(options,args) = parser.parse_args()
+
+	setup_logging(options.local_mode)
+
+	if options.metric_name_prefix is None:
+		show_error_and_exit("Metric name prefix needs to be provided",show_help=False)
+
+	if options.metric_name_prefix is not None:
+		metric_name_prefix = materialize_metric_name_prefix(options.metric_name_prefix)
+
+	if options.metric_client_type is None:
+		show_error_and_exit("Metric client type must be provided",show_help=False)
+
+	metric_client_module_name = 'metricclient-%s' % options.metric_client_type
+
+	if options.metric_client_params is not None:
+		metric_client_params = dict([p.split("=",1) for p in options.metric_client_params.split(",")])
+	else:
+		metric_client_params = {}
+
+	if options.host_list is None:
+		show_error_and_exit("Host list must be provided",show_help=False)
+
+	if options.port is None:
+		show_error_and_exit("Port must be provided",show_help=False)
+
+	if options.column_families is None:
+		show_error_and_exit("Column families must be provided",show_help=False)
+
+	if options.bucket_value_list is None:
+		show_error_and_exit("Bucket value list must be provided",show_help=False)
+
+	if options.required_percentiles_list is None:
+		show_error_and_exit("Percentiles list must be provided",show_help=False)
+
+	bucket_value_list = [int(x.strip()) for x in options.bucket_value_list.split(",")]
+	required_percentiles_list = [float(x.strip()) for x in options.required_percentiles_list.split(",")]
+
+	hosts = [x.strip() for x in options.host_list.split(",")]
+	port = int(options.port)
+
+	column_families = [x.strip() for x in options.column_families.split(",")]
+
+	keyspace = options.keyspace
+
+	code_path = os.path.split(sys.argv[0])[0]
+	if not os.path.exists('%s/%s.py' % (code_path,metric_client_module_name)):
+		show_error_and_exit("Unrecognized metric client type %s. cannot find %s" % (options.metric_client_type,metric_client_module_name))
+	
+	try:
+		sys.path.append(code_path)
+		metric_client = __import__(metric_client_module_name)
+		logging.info("Using metric client %s" % options.metric_client_type)
+		metric_client.initialize(metric_client_params)
+		logging.info("Metric client intiialized with params %s" % str(metric_client_params))
+	except:
+		show_error_and_exit("Could not load metric client %s. module name %s not found. Traceback %s" % (options.metric_client_type,metric_client_module_name,traceback.format_exc()))
+
+	ref_time = time.time()
+	metrics_sender = MetricsSender(metric_name_prefix,metric_client)
+
+	try:
+		run_error_count = 0
+		analysis_error_count = 0
+		reducing_error_count = 0
+		percentile_calculation_error_count = 0
+		column_family_count = 0
+
+
+		metric_data_list = []
+		for column_family in column_families:
+			cf_metric_name_prefix = "data.%(keyspace)s.%(column_family)s" % vars()
+			column_family_count += 1
+			for host in hosts:
+				logging.info("Running node tool for keyspace %(keyspace)s column family %(column_family)s, on host %(host)s:%(port)s" % vars())
+				runner = CfHistogramRunner(keyspace,column_family,host,port)
+				try:
+					output = runner.run()
+				except:
+					run_error_count += 1
+					logging.error("Could not run nodetool command %s" % traceback.format_exc())
+					continue
+
+				try:
+					analyzer = CfHistorgramAnalyzer(output)
+					analyzer.analyze(output)
+				except:
+					analysis_error_count += 1
+					logging.error("Could not perform analysis %s" % traceback.format_exc())
+					continue
+
+				try:
+					histogram_reducer = HistogramReducer(bucket_value_list)
+					for name,histogram in analyzer.iter_histograms():
+						reduced_histogram = histogram_reducer.reduce_histogram(histogram)
+						metric_data_list += reduced_histogram.get_metric_data_list(cf_metric_name_prefix)
+				except:
+					reducing_error_count += 1
+					logging.error("Could not perform reducing %s" % traceback.format_exc())
+					continue
+
+				try:
+					for name,histogram in analyzer.iter_histograms():
+						percentile_calculator = HistogramPercentileCalculator(name,required_percentiles_list)
+						percentile_calculator.calculate_percentiles(histogram)
+						metric_data_list += percentile_calculator.get_metric_data_list(cf_metric_name_prefix)
+				except:
+					percentile_calculation_error_count += 1
+					logging.error("Could not perform percentile_calculation %s" % traceback.format_exc())
+					continue
+
+				
+
+			total_time = time.time() - ref_time
+			metric_data_list.append(MetricData('metadata.execution.total_time',total_time))
+			metric_data_list.append(MetricData('metadata.execution.column_family_count',column_family_count))
+			metric_data_list.append(MetricData('metadata.execution.run_error_count',run_error_count))
+			metric_data_list.append(MetricData('metadata.execution.analysis_error_count',analysis_error_count))
+			metric_data_list.append(MetricData('metadata.execution.reducing_error_count',reducing_error_count))
+			metric_data_list.append(MetricData('metadata.execution.percentile_calculation_error_count',percentile_calculation_error_count))
+
+			metrics_sender.send(ref_time,metric_data_list)
+			metrics_sender.done()
+
+			logging.info("Done. Total time taken is %4.3f seconds. run errors %s analysis errors %s" % (total_time,run_error_count,analysis_error_count))
+	except Exception,e:
+		logging.fatal("FAILED. Total time taken is %4.3f seconds" % (time.time() - ref_time))
+		show_error_and_exit("An error has occurred. %s" % traceback.format_exc(),error_code=100,show_help=False)
+
+
+
+
