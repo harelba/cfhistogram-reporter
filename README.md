@@ -1,5 +1,5 @@
-# Cassandra cfhistogram reporter
-This tool analyzes the output of cassandra's "nodetool cfhistogram" and sends metrics to a metric backend such as graphite. 
+# Cassandra cfhistograms reporter
+This tool analyzes the output of cassandra's "nodetool cfhistograms" and sends metrics to a metric backend such as graphite. 
 
 The tool analyzes the following information per node/keyspace/column family:
  * Row sizes
