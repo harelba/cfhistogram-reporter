@@ -18,7 +18,7 @@ In the future, this tool will expand to other cassandra metrics.
 ### Installation
 The simplest way is to run the tool periodically (e.g. minutely through cron) from each of the cassandra nodes in the cluster. This is easy if you have some kind of configuration management tool such as chef or puppet. If deploying it to all the cassandra nodes is hard, then you can run it in a remote mode by providing a cassandra host list using the `-H` parameter. The only requirement when run this way is that nodetool will be available in the machine running cfhistogram-reporter. The easiest way to do that is to just run it on one of the cassandra nodes.
 
-In order to perform autodiscovery of keyspaces/column families, the tool requires ![pycassa](https://github.com/pycassa/pycassa) to be installed. Just install it using pip install, or specify the list of keyspaces/column families manually in the parameters. See the `-k` and `-c` parameters.
+In order to perform autodiscovery of keyspaces/column families, the tool requires [pycassa](https://github.com/pycassa/pycassa) to be installed. Just install it using pip install, or specify the list of keyspaces/column families manually in the parameters. See the `-k` and `-c` parameters.
 
 ### Usage
 Here is an example command line running the tool:
