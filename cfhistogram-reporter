@@ -183,6 +183,39 @@ class CfHistorgramAnalyzer(object):
 					self.measurement_histograms[name] = MeasurementHistogram(name)
 				self.measurement_histograms[name].add_value(value,count)
 
+class CassandraApi(object):
+	def __init__(self,host,port):
+		self.host = host
+		self.port = port
+		try:
+			from pycassa import SystemManager
+			host = self.host
+			port = self.port	
+			self.sm = SystemManager('%(host)s:%(port)s' % vars())
+			self.available = True
+		except:
+			self.sm = None
+			self.available = False
+
+	def is_available(self):
+		return self.available
+
+	def get_keyspaces(self):
+		if self.sm is None:
+			raise Exception("Cassandra API is not available")
+		result = self.sm.list_keyspaces()
+		host = self.host
+		port = self.port
+		logging.info('Got keyspaces list for %(host)s:%(port)s - result is %(result)s' % vars())
+		return result
+
+	def get_keyspace_column_families(self,keyspace):
+		if self.sm is None:
+			raise Exception("Cassandra API is not available")
+		result = self.sm.get_keyspace_column_families(keyspace)
+		logging.info('Got column families for keyspace %s - Result is %s' % (keyspace,result))
+		return result
+
 def get_source_host():
         return os.uname()[1]
 
@@ -225,17 +258,21 @@ class MetricsSender(object):
 	def done(self):
 		self.metric_client.done()
 
-def setup_logging(local_mode=False):
+def setup_logging(local_mode=False,log_file_location=None):
 	FORMAT = '%(asctime)-15s %(levelname)s %(message)s'
 
 	if local_mode:
 		logging.basicConfig(format=FORMAT, level=logging.INFO)
 		return
 
-	log_folder = os.path.join(os.path.split(sys.argv[0])[0],'logs')
-	if not os.path.exists(log_folder):
-		os.makedirs(log_folder)
-	log_filename = os.path.join(os.path.split(sys.argv[0])[0],'logs','cfhistogram-reporter.log')
+	if log_file_location is None:
+		log_folder = os.path.join(os.path.split(sys.argv[0])[0],'logs')
+		if not os.path.exists(log_folder):
+			os.makedirs(log_folder)
+		log_filename = os.path.join(os.path.split(sys.argv[0])[0],'logs',"%s.log" % os.path.split(sys.argv[0])[1])
+	else:
+		log_filename = log_file_location
+
 	logger = logging.getLogger()
 	logger.setLevel(logging.INFO)
 	handler = logging.handlers.RotatingFileHandler(log_filename,maxBytes=20000000,backupCount=5)
@@ -249,36 +286,72 @@ def show_error_and_exit(msg,error_code=1,show_help=True):
 		parser.print_help()
 	sys.exit(error_code)
 
+def get_effective_column_families(cass_api,effective_keyspace,column_families):
+	if column_families == 'ALL':
+		try:
+			x = cass_api.get_keyspace_column_families(effective_keyspace)
+			return sorted(x.keys())
+		except:
+			logging.error('Could not get column families for keyspace %s - %s' % (effective_keyspace,traceback.format_exc()))
+			return None
+	else:
+		return [x.strip() for x in column_families.split(",")]
+
+def get_effective_keyspaces(cass_api,keyspaces,blacklisted_keyspaces_str):
+	if blacklisted_keyspaces_str is None:
+		blacklisted_keyspaces_set = set()
+	else:
+		blacklisted_keyspaces_set = set([x.strip() for x in blacklisted_keyspaces_str.split(",")])
+	logging.info('blacklisted keyspaces: %s' % str(blacklisted_keyspaces_set))
+
+	if keyspaces == 'ALL':
+		try:
+			all_keyspaces = sorted(cass_api.get_keyspaces())
+		except:
+			logging.error('Could not get keyspaces %s' % traceback.format_exc())
+			return None
+	else:
+		all_keyspaces = [x.strip() for x in keyspaces.split(",")]
+
+	logging.info('all keyspaces: %s' % str(all_keyspaces))
+
+	effective_keyspaces = list(set(all_keyspaces) - blacklisted_keyspaces_set)
+	logging.info('effective keyspaces: %s' % str(effective_keyspaces))
+	return effective_keyspaces
+
 if __name__ == '__main__':
-	parser = OptionParser(usage="""
-This program reads cassandra nodetool's cfhistogram output, analyzes it, 
-and sends the data to a metric backend such as graphite
-""")
-	parser.add_option("-k","--keyspace",dest="keyspace",default=None,
-	                help="Keyspace")
+	parser = OptionParser()
+	parser.add_option("-k","--keyspaces",dest="keyspaces",default=None,
+	                help="Keyspace name. Can be ALL if pycassa is installed")
 	parser.add_option("-c","--column-family",dest="column_families",default=None,
-	                help="column family list. Currently, needs to be specified manually. ALL will be added in the future")
+	                help="column family list. Can be ALL if pycassa is installed")
 	parser.add_option("-H","--host-list",dest="host_list",default=None,
 	                help="list of hosts")
 	parser.add_option("-p","--port",dest="port",default=None,
-	                help="port (same for all hosts)")
+	                help="nodetool port (actually JMX port, same for all hosts)")
+	parser.add_option("-A","--api-port",dest="api_port",default=9160,
+	                help="Cassandra API port (not the JMX port). Required only if using ALL for keyspace or column families")
 
 	parser.add_option("-C","--metric-client-type",dest="metric_client_type",default=None,
-	                help="Type of metric client. currently supported types are 'stdout' and 'graphite'. The 'graphite' type requires the following client params (-P): 'server=X,port=Y'")
+	                help="Type of metric client. currently supported types are 'stdout' and 'graphite'. The 'graphite' type requires the following client params (-P): 'host=X,port=Y'")
 	parser.add_option("-P","--metric-client-params",dest="metric_client_params",default=None,
 	                help="Comma separated list of parameters in the format x=y. Will be passed to the metric client")
 	parser.add_option("-n","--metric-name-prefix",dest="metric_name_prefix",default=None,
-	                help="Prefix for all metrics. You can add ${HOSTNAME} in the prefix and it will be replaced with 'domain.hostname'. Note that you'd need to use single quotes in the command line so the $ sign will not be parsed by the shell")
+	                help="Prefix for all metrics. You can add ${HOSTNAME} in the prefix and it will be replaced with 'domain.hostname'. E.g. data.hadoop.jobtracker.${HOSTNAME} . Note that you'd need to use single quotes in the command line so the $ sign will not be parsed by the shell")
 	parser.add_option("-L","--local-mode",dest="local_mode",default=False,action='store_true',
                         help="Activate local mode (logging to console)")
-	parser.add_option("-b","--bucket-value-list",dest="bucket_value_list",default="1,10,100,1000,10000",
-                        help="Comma separated list of bucket values (e.g. 1,10,100,1000,10000). ALL will be added in the future")
-	parser.add_option("-r","--required-percentiles-list",dest="required_percentiles_list",default="0.25,0.5,0.9,0.99,0.999,1",
-                        help="Comma separated list of percentile values, floating point style - e.g. 0.0001,0.25,0.5,0.9,0.99,0.999")
+	parser.add_option("-l","--log-file-location",dest="log_file_location",default=None,
+                        help="full filename location of log file, default is under a logs/ folder in the executable's folder")
+	parser.add_option("-b","--bucket-value-list",dest="bucket_value_list",default=None,
+                        help="List of bucket values")
+	parser.add_option("-r","--required-percentiles-list",dest="required_percentiles_list",default=None,
+                        help="List of percentile values, floating point style - e.g. 0.95, 0.1 etc")
+	parser.add_option("-B","--blacklisted-keyspaces",dest="blacklisted_keyspaces",default=None,
+                        help="Comma separated list of blacklisted keyspaces")
 
 	(options,args) = parser.parse_args()
 
-	setup_logging(options.local_mode)
+	setup_logging(options.local_mode,options.log_file_location)
 
 	if options.metric_name_prefix is None:
 		show_error_and_exit("Metric name prefix needs to be provided",show_help=False)
@@ -302,10 +375,6 @@ and sends the data to a metric backend such as graphite
 	if options.port is None:
 		show_error_and_exit("Port must be provided",show_help=False)
 
-	if options.keyspace is None:
-		show_error_and_exit("Keyspace must be provided",show_help=False)
-
-
 	if options.column_families is None:
 		show_error_and_exit("Column families must be provided",show_help=False)
 
@@ -321,13 +390,15 @@ and sends the data to a metric backend such as graphite
 	hosts = [x.strip() for x in options.host_list.split(",")]
 	port = int(options.port)
 
-	column_families = [x.strip() for x in options.column_families.split(",")]
+	cass_api = CassandraApi(hosts[0],options.api_port)
 
-	keyspace = options.keyspace
+	keyspaces = get_effective_keyspaces(cass_api,options.keyspaces,options.blacklisted_keyspaces)
+	if keyspaces is None:
+		show_error_and_exit("Can't get keyspaces from cassandra (is pycassa installed? Is the api-port parameter configured to the right port?",show_help=False)
 
 	code_path = os.path.split(sys.argv[0])[0]
 	if not os.path.exists('%s/%s.py' % (code_path,metric_client_module_name)):
-		show_error_and_exit("Unrecognized metric client type %s. cannot find %s" % (options.metric_client_type,metric_client_module_name))
+		show_error_and_exit("Unrecognized metric client type %s. cannot find %s" % (options.metric_client_type,metric_client_module_name),show_help=False)
 	
 	try:
 		sys.path.append(code_path)
@@ -336,7 +407,7 @@ and sends the data to a metric backend such as graphite
 		metric_client.initialize(metric_client_params)
 		logging.info("Metric client intiialized with params %s" % str(metric_client_params))
 	except:
-		show_error_and_exit("Could not load metric client %s. module name %s not found. Traceback %s" % (options.metric_client_type,metric_client_module_name,traceback.format_exc()))
+		show_error_and_exit("Could not load metric client %s. module name %s not found. Traceback %s" % (options.metric_client_type,metric_client_module_name,traceback.format_exc()),show_help=False)
 
 	ref_time = time.time()
 	metrics_sender = MetricsSender(metric_name_prefix,metric_client)
@@ -346,65 +417,77 @@ and sends the data to a metric backend such as graphite
 		analysis_error_count = 0
 		reducing_error_count = 0
 		percentile_calculation_error_count = 0
+		keyspace_count = 0
 		column_family_count = 0
+		column_family_fetch_error_count = 0
+		
 
 
 		metric_data_list = []
-		for column_family in column_families:
-			cf_metric_name_prefix = "data.%(keyspace)s.%(column_family)s" % vars()
-			column_family_count += 1
-			for host in hosts:
-				logging.info("Running node tool for keyspace %(keyspace)s column family %(column_family)s, on host %(host)s:%(port)s" % vars())
-				runner = CfHistogramRunner(keyspace,column_family,host,port)
-				try:
-					output = runner.run()
-				except:
-					run_error_count += 1
-					logging.error("Could not run nodetool command %s" % traceback.format_exc())
-					continue
-
-				try:
-					analyzer = CfHistorgramAnalyzer(output)
-					analyzer.analyze(output)
-				except:
-					analysis_error_count += 1
-					logging.error("Could not perform analysis %s" % traceback.format_exc())
-					continue
-
-				try:
-					histogram_reducer = HistogramReducer(bucket_value_list)
-					for name,histogram in analyzer.iter_histograms():
-						reduced_histogram = histogram_reducer.reduce_histogram(histogram)
-						metric_data_list += reduced_histogram.get_metric_data_list(cf_metric_name_prefix)
-				except:
-					reducing_error_count += 1
-					logging.error("Could not perform reducing %s" % traceback.format_exc())
-					continue
-
-				try:
-					for name,histogram in analyzer.iter_histograms():
-						percentile_calculator = HistogramPercentileCalculator(name,required_percentiles_list)
-						percentile_calculator.calculate_percentiles(histogram)
-						metric_data_list += percentile_calculator.get_metric_data_list(cf_metric_name_prefix)
-				except:
-					percentile_calculation_error_count += 1
-					logging.error("Could not perform percentile_calculation %s" % traceback.format_exc())
-					continue
-
+		for keyspace in keyspaces:
+			keyspace_count += 1
+			column_families = get_effective_column_families(cass_api,keyspace,options.column_families)
+			if column_families is None:
+				logging.error("Couldn't get column families for keyspace %s. Skipping" % keyspace)
+				column_family_fetch_error_count += 1
+				continue
+			for column_family in column_families:
+				cf_metric_name_prefix = "data.%(keyspace)s.%(column_family)s" % vars()
+				column_family_count += 1
+				for host in hosts:
+					logging.info("Running node tool for keyspace %(keyspace)s column family %(column_family)s, on host %(host)s:%(port)s" % vars())
+					runner = CfHistogramRunner(keyspace,column_family,host,port)
+					try:
+						output = runner.run()
+					except:
+						run_error_count += 1
+						logging.error("Could not run nodetool command %s" % traceback.format_exc())
+						continue
+	
+					try:
+						analyzer = CfHistorgramAnalyzer(output)
+						analyzer.analyze(output)
+					except:
+						analysis_error_count += 1
+						logging.error("Could not perform analysis %s" % traceback.format_exc())
+						continue
+	
+					try:
+						histogram_reducer = HistogramReducer(bucket_value_list)
+						for name,histogram in analyzer.iter_histograms():
+							reduced_histogram = histogram_reducer.reduce_histogram(histogram)
+							metric_data_list += reduced_histogram.get_metric_data_list(cf_metric_name_prefix)
+					except:
+						reducing_error_count += 1
+						logging.error("Could not perform reducing %s" % traceback.format_exc())
+						continue
+	
+					try:
+						for name,histogram in analyzer.iter_histograms():
+							percentile_calculator = HistogramPercentileCalculator(name,required_percentiles_list)
+							percentile_calculator.calculate_percentiles(histogram)
+							metric_data_list += percentile_calculator.get_metric_data_list(cf_metric_name_prefix)
+					except:
+						percentile_calculation_error_count += 1
+						logging.error("Could not perform percentile_calculation %s" % traceback.format_exc())
+						continue
+	
 				
 
-			total_time = time.time() - ref_time
-			metric_data_list.append(MetricData('metadata.execution.total_time',total_time))
-			metric_data_list.append(MetricData('metadata.execution.column_family_count',column_family_count))
-			metric_data_list.append(MetricData('metadata.execution.run_error_count',run_error_count))
-			metric_data_list.append(MetricData('metadata.execution.analysis_error_count',analysis_error_count))
-			metric_data_list.append(MetricData('metadata.execution.reducing_error_count',reducing_error_count))
-			metric_data_list.append(MetricData('metadata.execution.percentile_calculation_error_count',percentile_calculation_error_count))
+		total_time = time.time() - ref_time
+		metric_data_list.append(MetricData('metadata.execution.total_time',total_time))
+		metric_data_list.append(MetricData('metadata.execution.run_error_count',run_error_count))
+		metric_data_list.append(MetricData('metadata.execution.analysis_error_count',analysis_error_count))
+		metric_data_list.append(MetricData('metadata.execution.reducing_error_count',reducing_error_count))
+		metric_data_list.append(MetricData('metadata.execution.percentile_calculation_error_count',percentile_calculation_error_count))
+		metric_data_list.append(MetricData('metadata.execution.keyspace_count',keyspace_count))
+		metric_data_list.append(MetricData('metadata.execution.column_family_count',column_family_count))
+		metric_data_list.append(MetricData('metadata.execution.column_family_fetch_error_count',column_family_fetch_error_count))
 
-			metrics_sender.send(ref_time,metric_data_list)
-			metrics_sender.done()
+		metrics_sender.send(ref_time,metric_data_list)
+		metrics_sender.done()
 
-			logging.info("Done. Total time taken is %4.3f seconds. run errors %s analysis errors %s" % (total_time,run_error_count,analysis_error_count))
+		logging.info("Done. Total time taken is %4.3f seconds. run errors %s analysis errors %s" % (total_time,run_error_count,analysis_error_count))
 	except Exception,e:
 		logging.fatal("FAILED. Total time taken is %4.3f seconds" % (time.time() - ref_time))
 		show_error_and_exit("An error has occurred. %s" % traceback.format_exc(),error_code=100,show_help=False)
