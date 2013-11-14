@@ -70,8 +70,8 @@ Here is the full usage information for the tool:
 
 ### Parameters
 Parameters related to keyspaces/column families to report on:
- * `-k` - A list of keyspaces. Can be set to ALL in order to scan all keyspaces (ALL requires ![pycassa](https://github.com/pycassa/pycassa) to be installed)
- * `-c` - A list of column families. Can be set to ALL in order to scan all column families in each of the provided keyspaces (ALL requires ![pycassa](https://github.com/pycassa/pycassa) to be installed)
+ * `-k` - A list of keyspaces. Can be set to ALL in order to scan all keyspaces (ALL requires [pycassa](https://github.com/pycassa/pycassa) to be installed)
+ * `-c` - A list of column families. Can be set to ALL in order to scan all column families in each of the provided keyspaces (ALL requires [pycassa](https://github.com/pycassa/pycassa) to be installed)
 
 Connectivity Parameters:
  * `-H` - List of cassandra node names. If the tool is run from each of the cassandra nodes, just set this parameter to the node's hostname, using back-ticked the hostname linux command
